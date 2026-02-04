@@ -313,3 +313,85 @@ def object_hash(fd, fmt, repo=None):
         case _: raise Exception(f"Unknown type {fmt}!")
 
     return object_write(obj, repo)
+
+def kvlm_parse(raw, start=0, dct=None):
+    """递归函数，键值列表解析器（用于commit和tag解析。
+    raw:传入文件字符串 start:开始解析位置，递归用，默认0. dct:词典
+    """
+
+    if not dct:
+        dct = dict()
+    
+    # We search for the next space and the next newline.
+    spc = raw.find(b' ', start)
+    nl = raw.find(b'\n', start)
+
+    # If newlines appears first (or there's no space, in which
+    # case find() returns -1), we assume a blank line, which means
+    # the remainder of the data is the "message".
+    #
+    # store it in dct with "None" as the key 
+    if (spc < 0) or (nl < spc):
+        assert nl == start
+        dct[None] = raw[start+1:]
+        return dct
+    
+    # Recursive case
+
+    key = raw[start:spc]
+
+    # Find the end of the value. Continuation lines begin with a
+    # space, so we loop until we find a "\n" not followed by a space
+    end = start
+    while True:
+        end = raw.find(b'\n', end+1)
+        if raw[end+1] != ord(' '): break
+
+    # drop the leading space on continuation lines
+    value = raw[spc+1:end].replace(b'\n', b'\n')
+
+    if key in dct:
+        if type(dct[key]) == list:
+            dct[key].append(value)
+        else:
+            dct[key] = [ dct[key], value ]
+    else:
+        dct[key] = value
+
+    return kvlm_parse(raw, start=end+1, dct=dct)
+
+def kvlm_serialize(kvlm):
+    """将kvlm转化为对应文件
+    """
+
+    ret = b''
+
+    for k in kvml.keys():
+        # Skip the message itself
+        if k == None: continue
+        val = kvlm[k]
+
+        if type(val) != list:
+            val = [ val ]
+
+        for v in val:
+            ret += k + b' ' + (v.replace(b'\n',b'\n')) + b'\n'
+
+    ret += b'\n' + kvml[None]
+
+    return ret
+
+class GitCommit(GitObject):
+    """fmt='commit'，kvlm为dict，储存键值"""
+    fmt=b'commit'
+
+    def deserialize(self, data):
+        """将解析后的data放入self.kvml"""
+        self.kvlm = kvlm_parse(data)
+
+    def serialize(self):
+        """返回文件内容"""
+        return kvlm_serialize(self.kvlm)
+    
+    def init(self):
+        self.kvlm = dict()
