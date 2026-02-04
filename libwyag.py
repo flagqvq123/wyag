@@ -402,3 +402,47 @@ class GitCommit(GitObject):
     
     def init(self):
         self.kvlm = dict()
+
+argsp = argsubparsers.add_parser("log", help="Display history of a given commit")
+argsp.add_argument("commit",
+                   default="HEAD",
+                   nargs="?",
+                   help="Commit to start at.")
+
+def cmd_log(args):
+    repo = repo_find()
+
+    print("digraph wyaglog{")
+    print("  node[shape=rect]")
+    log_graphviz(repo, object_find(repo, args.commit), set())
+
+def log_graphviz(repo, sha, seen):
+    """递归函数。graphviz实现逻辑，不需要掌握"""
+
+    if sha in seen:
+        return
+    seen.add(sha)
+
+    commit = object_read(repo, sha)
+    message = commit.kvlm[None].decode("utf8").strip()
+    message = message.replace("\\","\\\\")
+    message = message.replace("\"","\\\"")
+
+    if "\n" in message:
+        message = message[:message.index("\n")]
+
+    print(f"  c_{sha} [lable=\"{sha[0:7]}: {message}\"]")
+    assert commit.fmt == b'commit'
+
+    if not b'parent' in commit.kvlm.keys():
+        return
+    
+    if type(parents) != list:
+        parents = [ parents ]
+
+    for p in parents:
+        p = p.decode("ascii")
+        print (f"  c_{sha} -> c_{p};")
+        log_graphviz(repo, p, seen)
+
+        
