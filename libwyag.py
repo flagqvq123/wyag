@@ -62,19 +62,19 @@ class GitRepository (object):
                 raise Exception("Unsupported repositoryformatversion {vers}")
 
 def repo_path(repo, *path):
-    """Compute path under repo's gitdir"""
+    """输入path和repo，输出repo.gitdir + "/path1" + "path2" ..."""
     return os.path.join(repo.gitdir, *path)                      #返回repo.gitdir + "/path"
 
 def repo_file(repo, *path, mkdir=False):                         #返回并可选地创建一个文件的路径。不创建文件，只创建到最后一个目录。
-    """Same as repo_path, but create dirname(*path) if absent. For
-    example, repo_file(r, \"refs\", \"heads\", \"master\") will create
-    .git/refs/heads if it doesn't exist."""
+    """输入path和repo，输出repo.gitdir + "/path1" + "path2" ...
+    可选项：mkdir，为真时创建指定路径，但不创建文件"""
 
     if repo_dir(repo, *path[:-1], mkdir=mkdir):
         return repo_path(repo, *path)
     
 def repo_dir(repo, *path, mkdir=False):                          #返回并可选地创建一个目录的路径。
-    """Same as repo_path, but mkdir *path if absent if mkdir."""
+    """输入path和repo，输出repo.gitdir + "/path1" + "path2" ...
+    可选项：mkdir为真时创建对应路径。若对应路径不指向文件夹则报错"""
 
     path = repo_path(repo, *path)
 
@@ -91,7 +91,10 @@ def repo_dir(repo, *path, mkdir=False):                          #返回并可�
         return None
 
 def repo_create(path):
-    """Create a new repository at path"""
+    """在指定路径生成.git文件，包含branches, objects, refs/tags, refs/heads
+    文件夹和description, HEAD, config文件。若指定路径已有.git文件夹或者路径不
+    指向一个文件夹而是文件则报错。返回GitRepository对象
+    """
 
     repo = GitRepository(path, True) # force选项为true
 
@@ -124,6 +127,7 @@ def repo_create(path):
     return repo
 
 def repo_default_config():
+    """生成一段配置字符串"""
     ret = configparser.ConfigParser()
 
     ret.add_section("core")
@@ -145,6 +149,9 @@ def cmd_init(args):
     repo_create(args.path)
 
 def repo_find(path=".", required=True):
+    """递归函数。返回一个GiyRepository对象，该对象对应路径在离path最近的.git文件路径。
+    path默认值为当前目录。若未查找到.git：required真则返回一个错误，否则返回空。
+    """
     path = os.path.realpath(path)
 
     if os.path.isdir(os.path.join(path, ".git")):   #递归终止条件：当前目录下有.git文件夹
@@ -189,8 +196,7 @@ What exactly that means depend on each subclass.
         pass
 
 def object_read(repo, sha):
-    """Read object sha from Git repository repo.    Return a 
-    GitObject whose exact type depends on the object."""
+    """读取对应哈希值的Objects。返回一个对应类型的Object"""
 
     path = repo_file(repo, "objects", sha[0:2], sha[2:])
 
@@ -270,6 +276,7 @@ def cat_file(repo, obj, fmt=None):
     sys.stdout.buffer.write(obj.serialize())
 
 def object_find(repo, name, fmt=None, follow=True): #名称解析函数，后续继续实现
+    """名称解析函数，返回哈希值。"""
     return name
 
 argsp = argsubparsers.add_parser("hash-object",
@@ -301,7 +308,7 @@ def cmd_hash_object(args):
         print(sha)
 
 def object_hash(fd, fmt, repo=None):
-    """ Hash object, writing it to repo if provided"""
+    """将输入的文件转化为对应类型Object并返回sha。若给出repo则生成对应文件"""
     data = fd.read()
 
     # Choose constructor according to fmt argument
