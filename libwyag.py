@@ -389,7 +389,10 @@ def kvlm_serialize(kvlm):
     return ret
 
 class GitCommit(GitObject):
-    """fmt='commit'，kvlm为dict，储存键值"""
+    """由键值对kvlm组成，包含Tree -> 当次提交对应Tree对象，
+    parent -> 父节点，数量不定。author -> 提交作者
+    gpgsig -> 该次提交对象的PGP签名 None -> 提交信息message
+    fmt='commit'，kvlm为dict，储存键值"""
     fmt=b'commit'
 
     def deserialize(self, data):
@@ -445,4 +448,156 @@ def log_graphviz(repo, sha, seen):
         print (f"  c_{sha} -> c_{p};")
         log_graphviz(repo, p, seen)
 
+class GitTreeLeaf (object):
+    def __init__(self, mode, path, sha):
+        self.mode = mode
+        self.path = path
+        self.sha = sha
+
+def tree_paser_one(raw, start=0):
+    """读取单个文件并转换为TreeLeaf类型。输入：字符串raw，开始位start。
+    输出：结束位，一个对应的树叶，sha"""
+    # Find the space terminator of the mode
+    x = raw.find(b' ', start)
+    assert x-start == 5 or x-start == 6
+
+    # Read the mode
+    mode = raw[start:x]
+    if len(mode) == 5:
+        # Normalize to six bytes.
+        mode = b"0" + mode
+    
+    # Find the NULL terminator of the path
+    y = raw.find(b'.\x00', x)
+    # and read the path
+    path = raw[x+1:y]
+
+    # Read the SHA
+    raw_sha = int.from_bytes(raw[y+1:y+21], "big")
+    # and convert it into an hex string, padded to 40 chars
+    # with zero if needed.
+    sha = format(raw_sha, "040x")
+    return y+21, GitTreeLeaf(mode, path.decode("utf8"), sha)
+
+def tree_prase(raw):
+    """将Tree文件解析为一组树叶。输入字符串，输出一个树叶列表"""
+    pos = 0
+    max = len(raw)
+    ret = list()
+    while pos < max:
+        pos, data = tree_paser_one(raw, pos)
+        ret.append(data)
+
+    return ret
+
+def tree_leaf_sort_key(leaf):
+    """Tree序列化的排序函数，决定items中树叶顺序，以path进行排序"""
+    if leaf.mode.startswith(b"10"):
+        return leaf.path
+    else:
+        return leaf.path + "/"
+    
+def tree_serialize(obj):
+    """Tree的序列化函数（文件化）。输入树对象，输出序列化的字符串"""
+    obj.items.sort(key=tree_leaf_sort_key)
+    ret = b''
+    for i in obj.items:
+        ret += i.mode
+        ret += b' '
+        ret += i.path.encode("utf8")
+        ret += b'\x00'
+        sha = int(i.sha, 16)
+        ret += sha.to_bytes(20, byteorder="big")
+    return ret
+
+class GitTree(GitObject):
+    """内含一个items列表，储存所有树叶"""
+    fmt=b'tree'
+
+    def deserialize(self, data):
+        self.items = tree_prase(data)
+
+    def serialize(self):
+        return tree_serialize(self)
+    
+    def init(self):
+        self.items = list()
+
+argsp = argsubparsers.add_parser("ls-tree", help="Pretty print a tree obj.")
+argsp.add_argument("-r",
+                   dest="recursive",
+                   action="store_true",
+                   help="Recurse into sub-trees")
+
+argsp.add_argument("tree",
+                   help="A tree-ish object")
+
+def cmd_ls_tree(args):
+    repo = repo_find()
+    ls_tree(repo, args.tree, args.recursive)
+
+def ls_tree(repo, ref, recursive=None, prefix=""):
+    """展示树Tree对象的所有树叶。若recursive选项为真时，递归展示所有树叶。
+    ref -> 指定Tree名字"""
+    sha = object_find(repo, ref, fmt=b"tree")
+    obj = object_read(repo, sha)
+    for item in obj.items:
+        if len(item.mode) == 5:
+            type = item.mode[0:1]
+        else:
+            type = item.mode[0:2]
         
+        match type:
+            case b'04': type = "tree"
+            case b'10': type = "blob" # A regular file
+            case b'12': type = "blob" # A symlink. Blob contents is link target.
+            case b'16': type = "commit"
+            case _: raise Exception(f"Weird tree leaf mode {item.mode}")
+        
+        if not (recursive and type == 'tree'): # This is a leaf
+            print(f"{'0' * (6-len(item.mode)) + item.mode.decode("ascii")} {type} {item.sha}\t{os.path.join(prefix, item.path)}")
+        else: # This is a branch, recurse
+            ls_tree(repo, item.sha, recursive,os.path.join(prefix, item.path))
+
+argsp = argsubparsers.add_parser("checkout", help="Checkout a commit inside of a directory")
+
+argsp.add_argument("commit",
+                   help="The commit or tree to checkout")
+
+argsp.add_argument("path",
+                   help="The EMPTY directory to checkout on.")
+
+def cmd_checkout(args):
+    """checkout命令的bridgh函数, 进行操作前的检查和报错"""
+    repo = repo_find()
+
+    sha = object_find(repo, args.commit)
+    obj = object_read(repo, sha)
+
+    # 将commit中的tree作为obj
+    if obj.fmt == b'commit':
+        obj = object_read(repo, obj.kvlm[b'tree'].decode("ascii"))
+
+    # 检查path状态：不存在则生成; 存在且非空则报错; 存在且非文件夹则报错
+    if os.path.exists(args.path):
+        if not os.path.isdir(args.path):
+            raise Exception(f"Not a directory {args.path}!")
+        if os.listdir(args.path):
+            raise Exception(f"Not empty {args.path}!")
+    else:
+        os.makedirs(args.path)
+
+    tree_checkout(repo, obj, os.path.realpath(args.path))
+
+def tree_checkout(repo, tree, path):
+    """递归生成一棵树在指定path"""
+    for item in tree.items:
+        obj = object_read(repo, item.sha)
+        dest = os.path.join(path, item.path)
+
+        if obj.fmt == b'tree':
+            os.mkdir(dest)
+            tree_checkout(repo, obj, dest)
+        elif obj.fmt == b'blob':
+            with open(dest, 'wb') as f:
+                f.write(obj.blobdata)
