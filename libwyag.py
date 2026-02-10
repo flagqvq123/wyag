@@ -6,6 +6,7 @@ from fnmatch import fnmatch
 import hashlib
 from math import ceil
 import os
+import re
 import sys
 import zlib
 
@@ -280,7 +281,7 @@ def object_find(repo, name, fmt=None, follow=True):
     repo -> 仓库对象
     name -> 对象名称,支持hash, short hash, tag, branch, HEAD
     fmt -> 期望的对象类型,函数会确保返回的对象是特定类型
-    follow -> 是否继续解析tag对象指向的对象,直到找到非tag对象或者fmt为None的对象
+    follow -> 是否跟随tag和commit指向的对象继续解析
     """
     sha = object_resolve(repo, name)
 
@@ -800,6 +801,10 @@ argsp.add_argument("name",
                    help="The name to parse")
 
 def cmd_rev_parse(args):
+    """
+    rev-parse命令的bridge函数, 进行参数处理
+    返回输入目标的哈希值
+    """
     if args.type:
         fmt = args.type.encode()
     else:
@@ -808,3 +813,170 @@ def cmd_rev_parse(args):
     repo = repo_find()
 
     print (object_find(repo, args.name, fmt, follow=True))
+
+class GitIndexEntry (object):
+    """索引“条目”, 每个表示一个文件"""
+    def __init__(self, ctime=None, mtime=None, dev=None, ino=None,
+                 mode_type=None, mode_perms=None, uid=None, gid=None,
+                 fsize=None, sha=None, flag_assume_valid=None,
+                 flag_stage=None, name=None):
+        # 上一次文件元数据变化时间
+        self.ctime = ctime
+        # 上一次文件数据改变时间
+        self.mtime = mtime
+        # 包含此文件的设备的 ID
+        self.dev = dev
+        # 文件的索引数
+        self.ino = ino
+        # 对象类型, b1000(regular), b1010(symlink), b1110(gitlink)
+        self.mode_type = mode_type
+        # 对象权限，整数
+        self.mode_perms = mode_perms
+        # 使用者 ID
+        self.uid = uid
+        # 组织 ID
+        self.gid = gid
+        # 对象大小, 字节数
+        self.fsize = fsize
+        # 对象 SHA
+        self.sha = sha
+        self.flag_assume_valid = flag_assume_valid
+        self.flag_stage = flag_stage
+        # 对象的名字(完整名)
+        self.name = name
+
+class GitIndex (object):
+    version = None
+    entries = []
+    # ext = None
+    # sha = None
+
+    def __init__(self, version=2, entries=None):
+        if not entries:
+            entries = list()
+
+            self.version = version
+            self.entries = entries
+
+def index_read(repo):
+    """index文件解析器, 读取.git/index文件并返回一个GitIndex类"""
+    index_file = repo_file(repo, "index")
+
+    # 新目录下无index存在
+    if not os.path.exists(index_file):
+        return GitIndex
+    
+    with open(index_file, 'rb') as f:
+        raw = f.read()
+
+    header = raw[:12]
+    signature = header[:4]
+    assert signature == b'DIRC' # 意思是'DirCache'
+    version = int.from_bytes(header[4:8], "big")
+    assert version == 2, "wyag only supports index file version 2"
+    count = int.from_bytes(header[8:12], "big")
+
+    entries = list()
+
+    content = raw[12:]
+    idx = 0
+    for i in range(0,count):
+        # Read creation time, as a unix timestamp (seconds since
+        # 1970-01-01 00:00:00, the epoch)
+        ctime_s = int.from_bytes(content[idx: idx+4], "big")
+        # Read creation time, as nanoseconds after that timestamps,
+        # for extra precision.
+        ctime_ns = int.from_bytes(content[idx+4: idx+8], "big")
+        # Same for modification time: first seconds from epoch.
+        mtime_s = int.from_bytes(content[idx+8: idx+12], "big")
+        mtime_ns = int.from_bytes(content[idx+12: idx+16], "big")
+        # Device ID
+        dev = int.from_bytes(content[idx+16: idx+20], "big")
+        # Inode
+        ino = int.from_bytes(content[idx+20: idx+24], "big")
+        # Ignored.
+        unused = int.from_bytes(content[idx+24: idx+26], "big")
+        assert 0 == unused
+        mode = int.from_bytes(content[idx+26: idx+28], "big")
+        mode_type = mode >> 12
+        assert mode_type in [0b1000, 0b1010, 0b1110]
+        mode_perms = mode & 0b0000000111111111
+        # User ID
+        uid = int.from_bytes(content[idx+28: idx+32], "big")
+        # Group ID
+        gid = int.from_bytes(content[idx+32: idx+36], "big")
+        # Size
+        fsize = int.from_bytes(content[idx+36: idx+40], "big")
+        # SHA (obj ID). We'll store it as a lowercase hex string
+        # for consistency
+        sha = format(int.from_bytes(content[idx+36:idx+40], "big"), "040x")
+        # Flags (we are going to ignore)
+        flags = int.from_bytes(content[idx+60: idx+62], "big")
+        # Parse flags
+        flag_assume_valid = (flags & 0b1000000000000000) != 0
+        flag_extended = (flags & 0b0100000000000000) != 0
+        assert not flag_extended
+        flag_stage =  flags & 0b0011000000000000
+        # Length of the name.  This is stored on 12 bits, some max
+        # value is 0xFFF, 4095.  Since names can occasionally go
+        # beyond that length, git treats 0xFFF as meaning at least
+        # 0xFFF, and looks for the final 0x00 to find the end of the
+        # name --- at a small, and probably very rare, performance
+        # cost.
+        name_length = flags & 0b0000111111111111
+
+        # We've read 62 bytes so far.
+        idx += 62
+
+        if name_length < 0xFFF:
+            assert content[idx + name_length] == 0x00
+            raw_name = content[idx:idx+name_length]
+            idx += name_length + 1
+        else:
+            print(f"Notice: Name is 0x{name_length:X} bytes long.")
+            null_idx = content.find(b'\x00', idx + 0xFFF)
+            raw_name = content[idx: null_idx]
+            idx = null_idx + 1
+        
+        name = raw_name.decode("utf8")
+
+        idx = 8 * ceil(idx / 8)
+
+        entries.append(GitIndexEntry(ctime=(ctime_s, ctime_ns),
+                                     mtime=(mtime_s, mtime_ns),
+                                     dev=dev,
+                                     ino=ino,
+                                     mode_type=mode_type,
+                                     mode_perms=mode_perms,
+                                     uid=uid,
+                                     gid=gid,
+                                     fsize=fsize,
+                                     sha=sha,
+                                     flag_assume_valid=flag_assume_valid,
+                                     flag_stage=flag_stage,
+                                     name=name))
+        
+    return GitIndex(version=version, entries=entries)
+
+argsp = argsubparsers.add_parser("ls-files", help="List all the stage files")
+argsp.add_argument("--verbose", action="store_true", help="Show everything")
+
+def cmd_ls_files(args):
+    repo = repo_find()
+    index = index_read(repo)
+    if args.verbose:
+        print(f"Index dile format v{index.version}, containing {len(index.entries)} entries.")
+
+    for e in index.entries:
+        print(e.name)
+        if args.verbose:
+            entry_type = {0b1000: "regular file",
+                          0b1010: "symlink",
+                          0b1110: "git link"}[e.mode_type]
+            print(f"  {entry_type} with perms: {e.mode_perms:o}")
+            print(f"  on blob: {e.sha}")
+            print(f"  created: {datetime.fromtimestamp(e.ctime[0])}.{e.ctime[1]}, modified: {datetime.fromtimestamp(e.mtime[0])}.{e.mtime[1]}")
+            print(f"  device: {e.dev}, inode: {e.ino}")
+            print(f"  user:{pwd.getpwuid(e.uid).pw_name} ({e.uid})  group: {grp.getgrnam(e.gid).gr_name} ({e.gid})")
+            print(f"  flags: stage={e.flag_stage}  assume_valid={e.flag_assume_valid}")
+
