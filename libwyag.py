@@ -275,9 +275,40 @@ def cat_file(repo, obj, fmt=None):
     obj = object_read(repo, object_find(repo, obj, fmt=fmt))
     sys.stdout.buffer.write(obj.serialize())
 
-def object_find(repo, name, fmt=None, follow=True): #名称解析函数，后续继续实现
-    """名称解析函数，返回哈希值。"""
-    return name
+def object_find(repo, name, fmt=None, follow=True):
+    """名称解析函数，返回哈希值。
+    repo -> 仓库对象
+    name -> 对象名称,支持hash, short hash, tag, branch, HEAD
+    fmt -> 期望的对象类型,函数会确保返回的对象是特定类型
+    follow -> 是否继续解析tag对象指向的对象,直到找到非tag对象或者fmt为None的对象
+    """
+    sha = object_resolve(repo, name)
+
+    if not sha:
+        raise Exception(f"No such reference {name}")
+    
+    if len(sha) > 1:
+        raise Exception("Ambiguous reference {name}: Candidates are: \n - {'\n - '.join(sha)}.")
+    
+    sha = sha[0]
+
+    if not fmt:
+        return sha
+    
+    while True:
+        obj = object_read(repo, sha)
+
+        if obj.fmt == fmt:
+            return sha
+        if not follow:
+            return None
+        
+        if obj.fmt == b'tag':
+            sha = obj.kvlm[b'object'].decode("ascii")
+        elif obj.fmt == b'commit' and fmt == b'tree':
+            sha = obj.kvlm[b'tree'].decode("ascii")
+        else:
+            return None
 
 argsp = argsubparsers.add_parser("hash-object",
                                  help="Compute object ID and optionally creates a blob from a file")
@@ -707,3 +738,73 @@ def tag_create(repo, name, ref, create_tag_object=False):
 def ref_create(repo, ref_name, sha):
     with open(repo_file(repo, "refs/" + ref_name), 'w') as fp:
         fp.write(sha + '\n')
+
+def object_resolve(repo, name):
+    """"将一个对象的名称解析为hash值返回。
+    支持的输入：
+        - hash
+        - short hash(有模糊歧义)
+        - tags(有模糊歧义)
+        - branches(有模糊歧义)
+        - HEAD"""
+    
+    candidates = list()
+    hashRE = re.compile(r"^[0-9A-Fa-f]{4,40}$")
+
+    # 空名字忽略
+    if not name.strip():
+        return None
+    
+    # HEAD
+    if name == "HEAD":
+        return [ ref_resolve(repo, "HEAD") ]
+    
+    # 十六进制字符串则尝试hash解析
+    if hashRE.match(name):
+        # Git应该需要至少四位来分辨hash
+        name = name.lower()
+        prefix = name[0:2]
+        path = repo_dir(repo, "objects", prefix, mkdir=False)
+        if path:
+            rem = name[2:]
+            for f in os.listdir(path):
+                if f.startswith(rem):
+                    candidates.append(prefix + f)
+
+    # 尝试寻找指针
+    as_tag = ref_resolve(repo, "refs/tags/" + name)
+    if as_tag:
+        candidates.append(as_tag)
+
+    as_branch = ref_resolve(repo, "refs/heads/" + name)
+    if as_branch:
+        candidates.append(as_branch)
+
+    as_remote_branch = ref_resolve(repo, "refs/remotes/" + name)
+    if as_remote_branch:
+        candidates.append(as_remote_branch)
+
+    return candidates
+
+argsp = argsubparsers.add_parser("rev-parse",
+                                 help="Parse revision (or other objects) identifiers")
+
+argsp.add_argument("--wyag-type",
+                   metavar="type",
+                   dest="type",
+                   choices=["blob", "commit", "tag", "tree"],
+                   default=None,
+                   help="Specify the expected type")
+
+argsp.add_argument("name",
+                   help="The name to parse")
+
+def cmd_rev_parse(args):
+    if args.type:
+        fmt = args.type.encode()
+    else:
+        fmt = None
+    
+    repo = repo_find()
+
+    print (object_find(repo, args.name, fmt, follow=True))
